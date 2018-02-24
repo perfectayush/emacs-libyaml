@@ -308,6 +308,127 @@ emacs_value_to_yaml(emacs_env *env, yaml_document_t *document, emacs_value value
 	}
 }
 
+/**
+ * @brief ypath_find_index_in_doc finds the index of ypath element in yaml document
+ *
+ * This function takes 3 parameters, one for yaml document, one for root node and one for yaml path.
+ * Recursive calls are made to tokenize yamlpath and search the path in the document
+ *
+ * For a document like shownin document below, you can find index of key4 with ypath 'key3.key4'.
+ * You can also jump to values like value4 using yaml path 'key3.key4.value4'.
+ *
+ * @param document   Yaml document to be parsed. This is a struct created from yaml_parse_load function
+ * @param node       Yaml node to start the search from. By default we pass the root node.
+ * @param searchpath Yaml path to be searched for. This is a dot seperated string for key lookup
+ * @return Index position of key looked up in the the yaml c string, assuming string index starts from 0.
+           Returns -1 if not found
+ *
+ * @see Fypath_search
+ */
+
+static int
+ypath_find_index_in_doc(yaml_document_t *document, yaml_node_t *node, char *searchpath)
+{
+  char searchpath_copy[256];
+  strcpy(searchpath_copy, searchpath);
+  char *first = strtok(searchpath_copy,".");
+  char *rest = strchr(searchpath,'.');
+  if(rest != NULL){
+    rest++;
+  }
+
+  if (first == NULL)
+    return node->start_mark.index;
+
+  switch (node->type) {
+  case YAML_SCALAR_NODE: {
+    if (strcmp(first,(const char*)node->data.scalar.value) == 0 && rest == NULL)
+      return node->start_mark.index;
+    else
+      return -1;
+  }
+  case YAML_SEQUENCE_NODE: {
+    yaml_node_item_t *beg = node->data.sequence.items.start;
+    yaml_node_item_t *end = node->data.sequence.items.top;
+    ptrdiff_t len = end - beg;
+    if (len == 0)
+      return -1;
+    for (yaml_node_item_t *item = beg; item < end; ++item) {
+      yaml_node_t *elm = yaml_document_get_node(document, *item);
+      int value = ypath_find_index_in_doc(document, elm, searchpath);
+      if (value != -1)
+        return value;
+    }
+  }
+  case YAML_MAPPING_NODE: {
+    yaml_node_pair_t *beg = node->data.mapping.pairs.start;
+    yaml_node_pair_t *end = node->data.mapping.pairs.top;
+
+    for (yaml_node_pair_t *pair = beg; pair < end; ++pair) {
+      yaml_node_t *key = yaml_document_get_node(document, pair->key);
+      yaml_node_t *val = yaml_document_get_node(document, pair->value);
+      if (strcmp(first,(const char *) key->data.scalar.value) == 0){
+        if (rest != NULL)
+          return ypath_find_index_in_doc(document, val, rest);
+        else
+          return key->start_mark.index;
+      }
+    }
+  }
+  default:
+    return -1;
+  }
+}
+
+/**
+ * @brief Fypath_search is the function that we bind to libyaml-ypath module function
+ *
+ * The declaration is similar to how emacs dynamic module functions are defined in c
+ * This function setups a yaml parser and parses the yaml document. The yaml_path
+ * is then searched in the yaml document using ypath_find_index_in_doc function and
+ * the correct index for character is returned. Index is incremented by 1 as we
+ * receive index of C string.
+ *
+ * @see ypath_find_index_in_doc
+ */
+static emacs_value
+Fypath_search(emacs_env *env, ptrdiff_t nargs, emacs_value args[], void *data)
+{
+	emacs_value code = args[0];
+	emacs_value ypath = args[1];
+	ptrdiff_t yaml_size = 0;
+	ptrdiff_t ypath_size = 0;
+	char *yaml_str = NULL;
+	char *ypath_str = NULL;
+
+	env->copy_string_contents(env, code, NULL, &yaml_size);
+	yaml_str = malloc(yaml_size);
+	if (yaml_str == NULL)
+		return env->intern (env, "nil");
+	env->copy_string_contents(env, code, yaml_str, &yaml_size);
+
+
+	env->copy_string_contents(env, ypath, NULL, &ypath_size);
+	ypath_str = malloc(ypath_size);
+	if (ypath_str == NULL)
+		return env->intern (env, "nil");
+	env->copy_string_contents(env, ypath, ypath_str, &ypath_size);
+
+	yaml_parser_t parser;
+	yaml_parser_initialize(&parser);
+	yaml_parser_set_input_string(&parser, (unsigned char*)yaml_str, yaml_size-1);
+
+	yaml_document_t document;
+	yaml_parser_load(&parser, &document);
+	if (parser.error != YAML_NO_ERROR) {
+		return env->intern(env, "nil");
+	}
+
+	yaml_node_t *root = yaml_document_get_root_node(&document);
+	int index = ypath_find_index_in_doc(&document, root, ypath_str);
+	return env->make_integer(env, (intmax_t) ++index);
+}
+
 struct emacs_write_data_t {
 	emacs_env *env;
 	emacs_value str;
@@ -386,6 +507,36 @@ emacs_module_init(struct emacs_runtime *ert)
 
 	DEFUN("libyaml-load", Fyaml_load, 1, 1, "Load YAML", NULL);
 	DEFUN("libyaml-dump", Fyaml_dump, 1, 1, "Dump YAML", NULL);
+  /**
+   * @brief libyaml-ypath is an emacs module function to find character position
+   * of a yaml element in a yaml document
+   *
+   * This function takes 2 parameters, one for yaml string and one for yaml path.
+   * yaml path is a simple key lookup in the YAML document. Example usage in elisp
+   * @code{.el}
+   * (libyaml-ypath yaml_str yaml_path)
+   * @code
+   *
+   * For a document like shownin document below, you can find index of key4 with ypath 'key3.key4'.
+   * You can also jump to values like value4 using yaml path 'key3.key4.value4'.
+   * @code{.yml}
+   * ---
+   * key1: value1
+   * key2: value2
+   * key3:
+   *    - value3
+   *		- key4: value4
+   * @endcode
+   *
+   * @param yaml_str   Yaml string to be parsed
+   * @param yaml_path  Yaml path to be searched for. This is a dot seperated key string
+   * @return Index position of key looked up in the the yaml string, assuming index starts from 1.
+   *         Returns 0 if not found
+   *
+   * @see Fypath_search
+   * @see ypath_find_index_in_doc
+   */
+	DEFUN("libyaml-ypath", Fypath_search, 2, 2, "Search ypath in YAML", NULL);
 
 #undef DEFUN
 
